@@ -1,0 +1,151 @@
+@if (ready) {
+<div class="container">
+  <h1>GDev Startup Time Viewer</h1>
+
+  <div class="tabs">
+    <button
+      (click)="activeTab = 'search'"
+      [class.active]="activeTab === 'search'"
+      class="tab-btn"
+    >Search</button>
+    <button
+      (click)="activeTab = 'aggregate'"
+      [class.active]="activeTab === 'aggregate'"
+      class="tab-btn"
+    >Aggregate</button>
+  </div>
+
+  @if (activeTab === 'search') {
+    <div class="tab-content">
+      <div class="search-box">
+        <input
+          type="text"
+          [(ngModel)]="searchQuery"
+          (ngModelChange)="onSearch($event)"
+          placeholder="Search metrics (e.g. gradle, spring-bean, webapp, infra, listener)..."
+          class="search-input"
+        />
+      </div>
+
+      @if (phases.length > 0 && !selectedPhase) {
+        <div class="results">
+          @for (phase of phases; track phase.name) {
+            <div class="phase-item" (click)="selectPhase(phase.name)">
+              <span class="phase-name">{{ phase.name }}</span>
+              <span class="phase-avg">{{ formatSec(phase.avgSec) }}</span>
+            </div>
+          }
+        </div>
+      }
+
+      @if (phases.length === 0 && searchQuery.length > 1 && !loading) {
+        <div class="no-results">No metrics found for "{{ searchQuery }}"</div>
+      }
+
+      @if (loading && !selectedPhase) {
+        <div class="loading">
+          <div class="spinner"></div>
+          Loading...
+        </div>
+      }
+
+      @if (selectedPhase) {
+        <div class="chart-container">
+          <div class="chart-header">
+            <h2>{{ selectedPhase }}</h2>
+            <div class="chart-controls">
+              <div class="days-selector">
+                @for (d of dayOptions; track d) {
+                  <button
+                    (click)="onDaysChange(d)"
+                    [class.active]="selectedDays === d"
+                    class="days-btn"
+                  >{{ d }}d</button>
+                }
+              </div>
+              <button (click)="clearSelection()" class="back-btn">Back to search</button>
+            </div>
+          </div>
+          @if (history.length > 0) {
+            <div class="chart-stats">
+              <span>Avg: <strong>{{ avgDuration || 'N/A' }}</strong></span>
+              <span>Min: <strong>{{ minDuration || 'N/A' }}</strong></span>
+              <span>Max: <strong>{{ maxDuration || 'N/A' }}</strong></span>
+              <span>Samples: <strong>{{ history.length }}</strong></span>
+            </div>
+          }
+          <canvas id="historyChart" width="800" height="300"></canvas>
+        </div>
+      }
+    </div>
+  }
+
+  @if (activeTab === 'aggregate') {
+    <div class="tab-content">
+      <div class="agg-controls">
+        <span>Period:</span>
+        <div class="days-selector">
+          @for (d of dayOptions; track d) {
+            <button (click)="onAggDaysChange(d)" [class.active]="aggDays === d" class="days-btn">{{ d }}d</button>
+          }
+        </div>
+        @if (groups.length === 0 && !aggLoading) {
+          <button (click)="loadAggregateData()" class="back-btn">Load Data</button>
+        }
+      </div>
+
+      @if (aggLoading) {
+        <div class="loading"><div class="spinner"></div> Loading...</div>
+      }
+
+      @for (group of groups; track group.name) {
+        <div class="agg-group">
+          <div class="agg-group-header" (click)="toggleGroup(group)">
+            <span class="agg-expand">{{ group.expanded ? '&#9660;' : '&#9654;' }}</span>
+            <span class="agg-group-name">{{ group.name }}. {{ group.label }}</span>
+            <span class="agg-group-stats">
+              Avg: <strong>{{ formatSec(group.avg) }}</strong>
+              &nbsp; Min: {{ formatSec(group.min) }}
+              &nbsp; Max: {{ formatSec(group.max) }}
+            </span>
+          </div>
+          @if (group.expanded) {
+            <div class="agg-items">
+              @for (item of group.items; track item.tag) {
+                <div class="agg-item" [class.has-children]="item.subItems.length > 0" (click)="item.subItems.length > 0 ? toggleItem(item) : null">
+                  <span class="agg-item-tag">
+                    @if (item.subItems.length > 0) {
+                      <span class="agg-expand-sm">{{ item.expanded ? '&#9660;' : '&#9654;' }}</span>
+                    }
+                    {{ item.tag }}
+                  </span>
+                  <span class="agg-item-stats">
+                    Avg: <strong>{{ formatSec(item.avg) }}</strong>
+                    &nbsp; Min: {{ formatSec(item.min) }}
+                    &nbsp; Max: {{ formatSec(item.max) }}
+                    &nbsp; ({{ item.count }} samples)
+                  </span>
+                </div>
+                @if (item.expanded && item.subItems.length > 0) {
+                  @for (sub of item.subItems; track sub.tag) {
+                    <div class="agg-item agg-sub-item">
+                      <span class="agg-item-tag">{{ sub.tag }}</span>
+                      <span class="agg-item-stats">
+                        Avg: <strong>{{ formatSec(sub.avg) }}</strong>
+                        &nbsp; ({{ sub.count }} samples)
+                      </span>
+                    </div>
+                  }
+                }
+              }
+              @if (group.items.length === 0) {
+                <div class="agg-item agg-empty">No data for this group</div>
+              }
+            </div>
+          }
+        </div>
+      }
+    </div>
+  }
+</div>
+}
