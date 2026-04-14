@@ -61,6 +61,7 @@ export class App implements OnInit {
         console.log('allPhases loaded:', this.allPhases.length);
         this.ready = true;
         console.log('ready:', this.ready);
+        this.cdr.detectChanges();
       },
       error: (err) => {
         console.error('ES error:', err);
