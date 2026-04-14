@@ -50,12 +50,17 @@ export class App implements OnInit {
           aggs: { avg_dur: { avg: { field: 'payload.duration' } } }
         }
       }
-    }).subscribe(res => {
-      this.ready = true;
-      this.allPhases = (res.aggregations?.tags?.buckets || []).map((b: any) => ({
-        name: b.key,
-        avgSec: b.avg_dur.value
-      }));
+    }).subscribe({
+      next: (res) => {
+        this.allPhases = (res.aggregations?.tags?.buckets || []).map((b: any) => ({
+          name: b.key,
+          avgSec: b.avg_dur.value
+        }));
+        this.ready = true;
+      },
+      error: () => {
+        this.ready = true;
+      }
     });
   }
 
