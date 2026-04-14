@@ -52,13 +52,18 @@ export class App implements OnInit {
       }
     }).subscribe({
       next: (res) => {
+        console.log('ES response:', res);
+        console.log('Buckets:', res.aggregations?.tags?.buckets?.length);
         this.allPhases = (res.aggregations?.tags?.buckets || []).map((b: any) => ({
           name: b.key,
           avgSec: b.avg_dur.value
         }));
+        console.log('allPhases loaded:', this.allPhases.length);
         this.ready = true;
+        console.log('ready:', this.ready);
       },
-      error: () => {
+      error: (err) => {
+        console.error('ES error:', err);
         this.ready = true;
       }
     });
