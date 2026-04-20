@@ -7,7 +7,7 @@ import { Chart, registerables } from 'chart.js';
 Chart.register(...registerables);
 
 const ES_URL = 'https://vpc-dx-observer-prod-domain-kr4y2j7e4rfn527rrw734bgigq.us-east-1.es.amazonaws.com';
-const INDEX = 'gdev-events-1';
+const INDEX = 'ae-startup-events-1';
 
 @Component({
   selector: 'app-root',
