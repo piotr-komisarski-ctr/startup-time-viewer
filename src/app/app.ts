@@ -208,7 +208,18 @@ export class App implements OnInit {
   }
 
   sortedBeans(row: StartupRow): SpringBean[] {
-    return [...(row.ae.spring_beans ?? [])].sort((a, b) => b.duration_ms - a.duration_ms);
+    // Appian boots multiple Spring contexts (webapp + one per plugin), so the
+    // same bean can show up several times — once per context that wires it.
+    // Keep only the slowest instance per (name, class).
+    const slowest = new Map<string, SpringBean>();
+    for (const b of row.ae.spring_beans ?? []) {
+      const key = `${b.name}|${b.class ?? ''}`;
+      const prev = slowest.get(key);
+      if (!prev || prev.duration_ms < b.duration_ms) {
+        slowest.set(key, b);
+      }
+    }
+    return [...slowest.values()].sort((a, b) => b.duration_ms - a.duration_ms);
   }
 
   fmt(ms: number | undefined): string {
