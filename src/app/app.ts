@@ -3,11 +3,49 @@ import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
 import { Chart, registerables } from 'chart.js';
+import 'chartjs-adapter-date-fns';
 
 Chart.register(...registerables);
 
-const ES_URL = 'https://vpc-dx-observer-prod-domain-kr4y2j7e4rfn527rrw734bgigq.us-east-1.es.amazonaws.com';
-const INDEX = 'ae-startup-events-1';
+const ES_URL  = 'https://vpc-dx-observer-prod-domain-kr4y2j7e4rfn527rrw734bgigq.us-east-1.es.amazonaws.com';
+const INDEX_AE   = 'ae-startup-events-2';
+const INDEX_GDEV = 'gdev-events-1';
+
+interface NameDuration {
+  name: string;
+  duration_ms: number;
+}
+
+interface SpringBean extends NameDuration {
+  class?: string;
+}
+
+interface AeDoc {
+  '@timestamp': string;
+  user: string;
+  branch: string;
+  commit: string;
+  latest_tag?: string;
+  agent_id?: string;
+  startup_type?: string;
+  tomcat_metrics: NameDuration[];
+  spring_beans: SpringBean[];
+}
+
+interface GdevPhase {
+  '@timestamp': string;
+  tag: string;
+  duration_seconds: number;
+}
+
+interface StartupRow {
+  ae: AeDoc;
+  phases?: GdevPhase[];  // populated lazily on expand
+  loadingPhases?: boolean;
+  expanded?: boolean;
+  totalAppianMs?: number;
+  totalMs?: number;
+}
 
 @Component({
   selector: 'app-root',
@@ -17,298 +55,237 @@ const INDEX = 'ae-startup-events-1';
   styleUrl: './app.css'
 })
 export class App implements OnInit {
-  ready = false;
-  activeTab = 'search';
-  searchQuery = '';
-  phases: { name: string; avgSec: number }[] = [];
-  selectedPhase: string | null = null;
-  history: any[] = [];
+  // filter state
+  filterUser = '';
+  filterBranch = '';
+  filterStartupType = '';
+  filterLatestTag = '';
+  daysBack = 7;
+
+  // result state
+  startups: StartupRow[] = [];
   loading = false;
-  chart: Chart | null = null;
-  avgDuration = '';
-  minDuration = '';
-  maxDuration = '';
-  selectedDays = 90;
-  dayOptions = [7, 30, 90];
-  aggDays = 30;
+  errorMsg = '';
 
-  // Aggregate tab
-  groups: AggGroup[] = [];
-  aggLoading = false;
+  // facet values, populated from data
+  knownUsers: string[] = [];
+  knownBranches: string[] = [];
+  knownStartupTypes = ['', 'full_start', 'webapp_restart', 'unknown'];
+  knownLatestTags: string[] = [];
 
-  private allPhases: { name: string; avgSec: number }[] = [];
+  // chart
+  private chart: Chart | null = null;
 
-  constructor(private http: HttpClient, private cdr: ChangeDetectorRef) {}
+  constructor(private http: HttpClient, private cd: ChangeDetectorRef) {}
 
-  ngOnInit() {
-    this.http.post<any>(`${ES_URL}/${INDEX}/_search`, {
-      size: 0,
-      query: { exists: { field: 'payload.tag' } },
-      aggs: {
-        tags: {
-          terms: { field: 'payload.tag.keyword', size: 500, order: { avg_dur: 'desc' } },
-          aggs: { avg_dur: { avg: { field: 'payload.duration' } } }
-        }
-      }
-    }).subscribe({
-      next: (res) => {
-        console.log('ES response:', res);
-        console.log('Buckets:', res.aggregations?.tags?.buckets?.length);
-        this.allPhases = (res.aggregations?.tags?.buckets || []).map((b: any) => ({
-          name: b.key,
-          avgSec: b.avg_dur.value
-        }));
-        console.log('allPhases loaded:', this.allPhases.length);
-        this.ready = true;
-        console.log('ready:', this.ready);
-        this.cdr.detectChanges();
+  ngOnInit(): void {
+    this.fetch();
+  }
+
+  fetch(): void {
+    this.loading = true;
+    this.errorMsg = '';
+
+    const filters: any[] = [
+      { range: { '@timestamp': { gte: `now-${this.daysBack}d` } } }
+    ];
+    if (this.filterUser) {
+      filters.push({ term: { user: this.filterUser } });
+    }
+    if (this.filterBranch) {
+      filters.push({ term: { branch: this.filterBranch } });
+    }
+    if (this.filterStartupType) {
+      filters.push({ term: { startup_type: this.filterStartupType } });
+    }
+    if (this.filterLatestTag) {
+      filters.push({ term: { latest_tag: this.filterLatestTag } });
+    }
+
+    const body = {
+      size: 200,
+      sort: [{ '@timestamp': 'desc' }],
+      query: { bool: { filter: filters } }
+    };
+
+    this.http.post<any>(`${ES_URL}/${INDEX_AE}/_search`, body).subscribe({
+      next: (r) => {
+        const hits = (r?.hits?.hits ?? []) as any[];
+        this.startups = hits.map((h: any): StartupRow => {
+          const ae = h._source as AeDoc;
+          const total = ae.tomcat_metrics?.find(m => m.name === 'startup_totalTimeMs')?.duration_ms;
+          const totalAppian = ae.tomcat_metrics?.find(m => m.name === 'startup_totalTimeAppianMs')?.duration_ms;
+          return {
+            ae,
+            totalMs: total,
+            totalAppianMs: totalAppian,
+            expanded: false
+          };
+        });
+        this.refreshFacets();
+        this.drawChart();
+        this.loading = false;
+        this.cd.detectChanges();
       },
       error: (err) => {
-        console.error('ES error:', err);
-        this.ready = true;
+        this.errorMsg = `Fetch failed: ${err?.message ?? err}`;
+        this.loading = false;
+        this.cd.detectChanges();
       }
     });
   }
 
-  onSearch(query: string) {
-    this.selectedPhase = null;
-    if (query.length < 2) {
-      this.phases = [];
-      return;
+  private refreshFacets(): void {
+    const users = new Set<string>();
+    const branches = new Set<string>();
+    const tags = new Set<string>();
+    for (const s of this.startups) {
+      if (s.ae.user) users.add(s.ae.user);
+      if (s.ae.branch) branches.add(s.ae.branch);
+      if (s.ae.latest_tag) tags.add(s.ae.latest_tag);
     }
-    const q = query.toLowerCase();
-    this.phases = this.allPhases.filter(p => p.name.toLowerCase().includes(q));
+    this.knownUsers = [...users].sort();
+    this.knownBranches = [...branches].sort();
+    this.knownLatestTags = [...tags].sort();
   }
 
-  selectPhase(phase: string) {
-    this.selectedPhase = phase;
-    this.loading = true;
-    this.avgDuration = '';
-    this.minDuration = '';
-    this.maxDuration = '';
-    const now = new Date().toISOString();
-    const from = new Date(Date.now() - this.selectedDays * 24 * 60 * 60 * 1000).toISOString();
-    this.http.post<any>(`${ES_URL}/${INDEX}/_search`, {
-      size: 2000,
+  toggle(row: StartupRow): void {
+    row.expanded = !row.expanded;
+    if (row.expanded && !row.phases && !row.loadingPhases) {
+      this.loadPhases(row);
+    }
+  }
+
+  // Joins phase data from gdev-events-1 for the given AE doc.
+  // Strategy: same user + ±45-min window around the AE doc's timestamp.
+  private loadPhases(row: StartupRow): void {
+    row.loadingPhases = true;
+    const aeTs = new Date(row.ae['@timestamp']);
+    const winStart = new Date(aeTs.getTime() - 45 * 60 * 1000).toISOString();
+    const winEnd = new Date(aeTs.getTime() + 5 * 60 * 1000).toISOString();
+
+    const filters: any[] = [
+      { term: { user: row.ae.user } },
+      { range: { '@timestamp': { gte: winStart, lte: winEnd } } }
+    ];
+    const body = {
+      size: 50,
       sort: [{ '@timestamp': 'asc' }],
-      query: {
-        bool: {
-          must: [
-            { term: { 'payload.tag.keyword': phase } },
-            { range: { '@timestamp': { gte: from, lte: now } } }
-          ]
-        }
+      query: { bool: { filter: filters } }
+    };
+
+    this.http.post<any>(`${ES_URL}/${INDEX_GDEV}/_search`, body).subscribe({
+      next: (r) => {
+        const hits = (r?.hits?.hits ?? []) as any[];
+        const phases: GdevPhase[] = hits
+          .map((h: any) => {
+            const s = h._source;
+            const tag = s?.payload?.tag ?? s?.tag ?? '?';
+            const durStr = s?.payload?.duration ?? s?.duration;
+            const dur = typeof durStr === 'string' ? parseFloat(durStr) : Number(durStr);
+            return {
+              '@timestamp': s['@timestamp'],
+              tag,
+              duration_seconds: isFinite(dur) ? dur : 0
+            };
+          })
+          // Only "real" phase tags — drop umbrella ones with unhelpful 'all'/'?' tags
+          .filter(p => p.tag && p.tag !== 'all' && p.tag !== '?');
+        row.phases = phases;
+        row.loadingPhases = false;
+        this.cd.detectChanges();
+      },
+      error: () => {
+        row.phases = [];
+        row.loadingPhases = false;
+        this.cd.detectChanges();
       }
-    }).subscribe(res => {
-      this.history = (res.hits?.hits || []).map((h: any) => ({
-        timestamp: h._source['@timestamp'],
-        duration: parseFloat(h._source.payload?.duration || '0'),
-        user: h._source.user,
-        branch: h._source.origin?.contract?.baseline,
-        event: h._source.payload?.event,
-      }));
-      this.loading = false;
-      this.computeStats();
-      this.cdr.detectChanges();
-      requestAnimationFrame(() => this.renderChart());
     });
   }
 
-  onDaysChange(days: number) {
-    this.selectedDays = days;
-    if (this.selectedPhase) {
-      this.selectPhase(this.selectedPhase);
-    }
+  sortedTomcat(row: StartupRow): NameDuration[] {
+    return [...(row.ae.tomcat_metrics ?? [])].sort((a, b) => b.duration_ms - a.duration_ms);
   }
 
-  clearSelection() {
-    this.selectedPhase = null;
-    if (this.chart) { this.chart.destroy(); this.chart = null; }
+  sortedBeans(row: StartupRow): SpringBean[] {
+    return [...(row.ae.spring_beans ?? [])].sort((a, b) => b.duration_ms - a.duration_ms);
   }
 
-  formatSec(sec: number): string {
-    if (sec >= 60) return (sec / 60).toFixed(1) + ' min';
-    return sec.toFixed(1) + 's';
+  fmt(ms: number | undefined): string {
+    if (ms == null || !isFinite(ms)) return '—';
+    if (ms < 1000) return `${ms} ms`;
+    const s = ms / 1000;
+    if (s < 60) return `${s.toFixed(1)} s`;
+    const m = Math.floor(s / 60);
+    const rs = Math.round(s - m * 60);
+    return `${m}m ${rs}s`;
   }
 
-  private computeStats() {
-    if (!this.history.length) return;
+  fmtSec(sec: number | undefined): string {
+    if (sec == null || !isFinite(sec)) return '—';
+    return this.fmt(sec * 1000);
+  }
+
+  fmtTs(ts: string): string {
     try {
-      const d = this.history.map((h: any) => Number(h.duration)).filter((v: number) => !isNaN(v) && v > 0);
-      console.log('computeStats:', d.length, 'values, first 3:', d.slice(0,3));
-      if (!d.length) return;
-      const sum = d.reduce((a: number, b: number) => a + b, 0);
-      let min = d[0], max = d[0];
-      for (const v of d) { if (v < min) min = v; if (v > max) max = v; }
-      this.avgDuration = this.formatSec(sum / d.length);
-      this.minDuration = this.formatSec(min);
-      this.maxDuration = this.formatSec(max);
-      console.log('stats:', this.avgDuration, this.minDuration, this.maxDuration);
-    } catch (e) {
-      console.error('computeStats error:', e);
+      const d = new Date(ts);
+      return d.toLocaleString();
+    } catch {
+      return ts;
     }
   }
 
-  private renderChart() {
-    if (this.chart) this.chart.destroy();
-    const canvas = document.getElementById('historyChart') as HTMLCanvasElement;
+  private drawChart(): void {
+    const canvas = document.getElementById('totalChart') as HTMLCanvasElement | null;
     if (!canvas) return;
+
+    if (this.chart) {
+      this.chart.destroy();
+      this.chart = null;
+    }
+    if (!this.startups.length) return;
+
+    // group by branch
+    const byBranch = new Map<string, { x: string; y: number }[]>();
+    // iterate oldest → newest so chart's x-axis reads left-to-right
+    [...this.startups].reverse().forEach(s => {
+      if (s.totalMs == null) return;
+      const branch = s.ae.branch || 'unknown';
+      if (!byBranch.has(branch)) byBranch.set(branch, []);
+      byBranch.get(branch)!.push({ x: s.ae['@timestamp'], y: s.totalMs / 1000 });
+    });
+
+    const palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+                     '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'];
+    const datasets = [...byBranch.entries()].map(([branch, points], i) => ({
+      label: branch,
+      data: points,
+      borderColor: palette[i % palette.length],
+      backgroundColor: palette[i % palette.length] + '33',
+      tension: 0.2,
+      pointRadius: 3
+    }));
 
     this.chart = new Chart(canvas, {
       type: 'line',
-      data: {
-        labels: this.history.map((h: any) =>
-          new Date(h.timestamp).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-        ),
-        datasets: [{
-          label: 'Duration (seconds)',
-          data: this.history.map((h: any) => h.duration),
-          borderColor: '#4a90d9',
-          backgroundColor: 'rgba(74, 144, 217, 0.1)',
-          fill: true,
-          tension: 0.3,
-          pointRadius: 3,
-        }]
-      },
+      data: { datasets } as any,
       options: {
         responsive: true,
+        maintainAspectRatio: false,
+        parsing: { xAxisKey: 'x', yAxisKey: 'y' } as any,
         scales: {
-          y: { beginAtZero: true, title: { display: true, text: 'Seconds' } },
-          x: { ticks: { maxRotation: 45, maxTicksLimit: 15 } }
+          x: { type: 'time' as any, time: { unit: 'day' as any } } as any,
+          y: { title: { display: true, text: 'startup_totalTimeMs (s)' } }
         },
         plugins: {
+          legend: { position: 'top' },
           tooltip: {
             callbacks: {
-              afterBody: (items: any) => {
-                const idx = items[0]?.dataIndex;
-                if (idx === undefined) return '';
-                const hit = this.history[idx];
-                const lines = [];
-                if (hit.user) lines.push(`User: ${hit.user}`);
-                if (hit.branch) lines.push(`Branch: ${hit.branch}`);
-                if (hit.event) lines.push(`Event: ${hit.event}`);
-                return lines.join('\n');
-              }
+              label: (ctx) => `${ctx.dataset.label}: ${(ctx.parsed.y as number).toFixed(1)} s`
             }
           }
         }
       }
     });
   }
-
-  loadAggregateData() {
-    this.aggLoading = true;
-    const from = new Date(Date.now() - this.aggDays * 24 * 60 * 60 * 1000).toISOString();
-    this.http.post<any>(`${ES_URL}/${INDEX}/_search`, {
-      size: 0,
-      query: {
-        bool: {
-          must: [
-            { exists: { field: 'payload.tag' } },
-            { range: { '@timestamp': { gte: from } } }
-          ]
-        }
-      },
-      aggs: {
-        tags: {
-          terms: { field: 'payload.tag.keyword', size: 500, order: { avg_dur: 'desc' } },
-          aggs: {
-            avg_dur: { avg: { field: 'payload.duration' } },
-            min_dur: { min: { field: 'payload.duration' } },
-            max_dur: { max: { field: 'payload.duration' } }
-          }
-        }
-      }
-    }).subscribe(res => {
-      const buckets = (res.aggregations?.tags?.buckets || []);
-      this.groups = this.buildGroups(buckets);
-      this.aggLoading = false;
-      this.cdr.detectChanges();
-    });
-  }
-
-  onAggDaysChange(days: number) {
-    this.aggDays = days;
-    this.loadAggregateData();
-  }
-
-  toggleGroup(group: AggGroup) {
-    group.expanded = !group.expanded;
-  }
-
-  private buildGroups(buckets: any[]): AggGroup[] {
-    const toItem = (b: any): AggItem => ({
-      tag: b.key, avg: b.avg_dur.value || 0, min: b.min_dur.value || 0,
-      max: b.max_dur.value || 0, count: b.doc_count, subItems: [], expanded: false,
-    });
-
-    const matchExact = (tags: string[]) => buckets.filter(b => tags.includes(b.key)).map(toItem);
-    const matchPrefix = (prefix: string) => buckets.filter(b => b.key.startsWith(prefix)).map(toItem);
-
-    const makeGroup = (name: string, label: string, items: AggItem[]): AggGroup => {
-      const avg = items.length ? items.reduce((s, i) => s + i.avg, 0) / items.length : 0;
-      let min = 0, max = 0;
-      if (items.length) {
-        min = items[0].min; max = items[0].max;
-        for (const i of items) { if (i.min < min) min = i.min; if (i.max > max) max = i.max; }
-      }
-      return { name, label, avg, min, max, items, expanded: false };
-    };
-
-    // D is special — has sub-groups
-    const dTopItems = matchExact(['webapp-startup', 'webapp-svc-startup']);
-    const dListeners = matchPrefix('webapp-').filter(i => !['webapp-startup', 'webapp-svc-startup'].includes(i.tag));
-    const dBeans = matchPrefix('spring-bean-');
-
-    if (dListeners.length) {
-      const listenerGroup: AggItem = {
-        tag: 'D.1 Listeners', avg: dListeners.reduce((s, i) => s + i.avg, 0) / dListeners.length,
-        min: 0, max: 0, count: dListeners.reduce((s, i) => s + i.count, 0),
-        subItems: dListeners.sort((a, b) => b.avg - a.avg), expanded: false,
-      };
-      dTopItems.push(listenerGroup);
-    }
-    if (dBeans.length) {
-      const beanGroup: AggItem = {
-        tag: `D.2 Spring Beans (${dBeans.length} beans)`,
-        avg: dBeans.reduce((s, i) => s + i.avg, 0) / dBeans.length,
-        min: 0, max: 0, count: dBeans.reduce((s, i) => s + i.count, 0),
-        subItems: dBeans.sort((a, b) => b.avg - a.avg), expanded: false,
-      };
-      dTopItems.push(beanGroup);
-    }
-
-    return [
-      makeGroup('A', 'Provisioning', []),
-      makeGroup('B', 'Gradle Build', matchExact(['gradle-build', 'gradle-rebuild'])),
-      makeGroup('C', 'Docker Build', matchExact(['docker-build', 'docker-rebuild'])),
-      makeGroup('D', 'Webapp Startup', dTopItems),
-      makeGroup('E', 'Daemons', matchExact(['sail-hot-deploy', 'sdx-server'])),
-      makeGroup('F', 'TRex', matchExact(['trex-start', 'build-trex', 'start-trex'])),
-    ];
-  }
-
-  toggleItem(item: AggItem) {
-    item.expanded = !item.expanded;
-  }
-}
-
-interface AggItem {
-  tag: string;
-  avg: number;
-  min: number;
-  max: number;
-  count: number;
-  subItems: AggItem[];
-  expanded: boolean;
-}
-
-interface AggGroup {
-  name: string;
-  label: string;
-  avg: number;
-  min: number;
-  max: number;
-  items: AggItem[];
-  expanded: boolean;
 }
