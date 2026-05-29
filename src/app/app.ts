@@ -207,12 +207,28 @@ export class App implements OnInit {
     return [...(row.ae.tomcat_metrics ?? [])].sort((a, b) => b.duration_ms - a.duration_ms);
   }
 
+  // Returns true if the bean line carries a usable class. Entries with no
+  // class (logged as "[null]") are measurement artifacts: their stopwatch in
+  // PerformanceTrackingBeanPostProcessor was never stopped (the static stats
+  // map is shared across Spring contexts, so the same bean name gets
+  // overwritten between contexts and one stopwatch is left running until
+  // logStatistics() reads it ≈ whole-startup time). Drop them — they are not
+  // real per-bean costs. The proper fix is server-side (per-context maps).
+  private hasUsableClass(b: SpringBean): boolean {
+    const c = (b.class ?? '').trim().toLowerCase();
+    return c !== '' && c !== 'null';
+  }
+
   sortedBeans(row: StartupRow): SpringBean[] {
     // Appian boots multiple Spring contexts (webapp + one per plugin), so the
     // same bean can show up several times — once per context that wires it.
-    // Keep only the slowest instance per (name, class).
+    // Drop class-less artifacts, then keep only the slowest instance per
+    // (name, class).
     const slowest = new Map<string, SpringBean>();
     for (const b of row.ae.spring_beans ?? []) {
+      if (!this.hasUsableClass(b)) {
+        continue;
+      }
       const key = `${b.name}|${b.class ?? ''}`;
       const prev = slowest.get(key);
       if (!prev || prev.duration_ms < b.duration_ms) {
