@@ -177,7 +177,7 @@ export class App implements OnInit {
     this.http.post<any>(`${ES_URL}/${INDEX_GDEV}/_search`, body).subscribe({
       next: (r) => {
         const hits = (r?.hits?.hits ?? []) as any[];
-        const phases: GdevPhase[] = hits
+        const all: GdevPhase[] = hits
           .map((h: any) => {
             const s = h._source;
             const tag = s?.payload?.tag ?? s?.tag ?? '?';
@@ -191,7 +191,19 @@ export class App implements OnInit {
           })
           // Only "real" phase tags — drop umbrella ones with unhelpful 'all'/'?' tags
           .filter(p => p.tag && p.tag !== 'all' && p.tag !== '?');
-        row.phases = phases;
+        // The window can catch the tail of the user's PREVIOUS startup (e.g.
+        // two restarts within 45 min), which showed each tag twice. Keep only
+        // the most recent occurrence per tag — the one belonging to the
+        // startup this AE doc describes. ISO timestamps compare as strings.
+        const latestByTag = new Map<string, GdevPhase>();
+        for (const p of all) {
+          const prev = latestByTag.get(p.tag);
+          if (!prev || p['@timestamp'] > prev['@timestamp']) {
+            latestByTag.set(p.tag, p);
+          }
+        }
+        row.phases = [...latestByTag.values()]
+          .sort((a, b) => a['@timestamp'].localeCompare(b['@timestamp']));
         row.loadingPhases = false;
         this.cd.detectChanges();
       },
@@ -255,7 +267,12 @@ export class App implements OnInit {
 
   fmtTs(ts: string): string {
     try {
-      const d = new Date(ts);
+      // gdev-events-1 stores timestamps WITHOUT a timezone suffix (e.g.
+      // "2026-06-11T12:10:41") but they are UTC; without the "Z" the Date
+      // constructor would parse them as local time and display them 2h off.
+      // ae-startup-events-2 timestamps carry "+00:00" and are unaffected.
+      const hasTz = /Z$|[+-]\d{2}:?\d{2}$/.test(ts);
+      const d = new Date(hasTz ? ts : ts + 'Z');
       return d.toLocaleString();
     } catch {
       return ts;
