@@ -91,8 +91,8 @@
           <th>Branch</th>
           <th>Commit</th>
           <th>Release</th>
-          <th>Total</th>
-          <th>Appian</th>
+          <th title="startup_totalTimeMs — webapp container only: JVM start to first HTTP request. NOT the whole gdev pipeline; expand the row for gradle/docker/daemon phase totals.">Webapp&nbsp;boot</th>
+          <th title="startup_totalTimeAppianMs — the Appian-bootstrap part of webapp boot (Spring context + listeners), excluding bare Tomcat overhead.">Appian&nbsp;init</th>
         </tr>
       </thead>
       <tbody>
