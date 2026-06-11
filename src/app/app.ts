@@ -47,6 +47,10 @@ interface StartupRow {
   // gdev-events-1): gradle -> docker -> webapp -> daemons. Excludes agent
   // provisioning / file sync, which happen before on_start.
   pipelineSeconds?: number;
+  // gradle-build + webapp-startup for this run — the same definition as the
+  // DX "Total GDev Startup Time" KPI (which reports team-wide medians of
+  // these two phases). Excludes docker build and daemons.
+  kpiSeconds?: number;
 }
 
 @Component({
@@ -118,7 +122,7 @@ export class App implements OnInit {
           expanded: false
         }));
         this.refreshFacets();
-        this.loadPipelineTotals();
+        this.loadGdevTotals();
         this.loading = false;
         this.cd.detectChanges();
       },
@@ -137,28 +141,34 @@ export class App implements OnInit {
     return new Date(hasTz ? ts : ts + 'Z').getTime();
   }
 
-  // Fetches gdev's `tag=all` events (duration of the whole on_start pipeline)
-  // in ONE query for every listed startup, then matches each AE doc to the
-  // first `all` event from the same user that completes shortly after the doc
-  // was published (the doc goes out right after webapp turns healthy; the
-  // remaining daemons finish within minutes).
-  private loadPipelineTotals(): void {
+  // Fetches the gdev phase events needed for the two per-row totals in ONE
+  // query for every listed startup:
+  //  - `all`            → pipelineSeconds (whole on_start wall clock)
+  //  - gradle-build / gradle-rebuild + webapp-startup / webapp-svc-startup
+  //                     → kpiSeconds (gradle + webapp, same definition as the
+  //                       DX "Total GDev Startup Time" KPI, which reports
+  //                       team-wide medians of exactly these two phases)
+  // The `all` event completes a few minutes AFTER the AE doc (daemons run
+  // after webapp turns healthy); gradle/webapp complete BEFORE it.
+  private loadGdevTotals(): void {
     if (!this.startups.length) {
       this.drawChart();
       return;
     }
     const times = this.startups.map(s => this.parseTsMs(s.ae['@timestamp']));
     const users = [...new Set(this.startups.map(s => s.ae.user))];
-    const winStart = new Date(Math.min(...times) - 60 * 1000).toISOString();
+    const winStart = new Date(Math.min(...times) - 50 * 60 * 1000).toISOString();
     const winEnd = new Date(Math.max(...times) + 60 * 60 * 1000).toISOString();
 
     const body = {
-      size: 2000,
+      size: 5000,
       sort: [{ '@timestamp': 'asc' }],
       query: {
         bool: {
           filter: [
-            { term: { 'payload.tag.keyword': 'all' } },
+            { terms: { 'payload.tag.keyword': [
+              'all', 'gradle-build', 'gradle-rebuild', 'webapp-startup', 'webapp-svc-startup'
+            ] } },
             { terms: { user: users } },
             { range: { '@timestamp': { gte: winStart, lte: winEnd } } }
           ]
@@ -168,27 +178,47 @@ export class App implements OnInit {
 
     this.http.post<any>(`${ES_URL}/${INDEX_GDEV}/_search`, body).subscribe({
       next: (r) => {
-        const byUser = new Map<string, { tMs: number; seconds: number }[]>();
+        const byUser = new Map<string, { tag: string; tMs: number; seconds: number }[]>();
         for (const h of (r?.hits?.hits ?? []) as any[]) {
           const s = h._source;
+          const tag = s?.payload?.tag ?? s?.tag;
           const durRaw = s?.payload?.duration ?? s?.duration;
           const dur = typeof durRaw === 'string' ? parseFloat(durRaw) : Number(durRaw);
-          if (!isFinite(dur) || dur <= 0) continue;
+          if (!tag || !isFinite(dur) || dur <= 0) continue;
           const list = byUser.get(s.user) ?? [];
-          list.push({ tMs: this.parseTsMs(s['@timestamp']), seconds: dur });
+          list.push({ tag, tMs: this.parseTsMs(s['@timestamp']), seconds: dur });
           byUser.set(s.user, list);
         }
         for (const row of this.startups) {
           const aeMs = this.parseTsMs(row.ae['@timestamp']);
-          const candidates = (byUser.get(row.ae.user) ?? [])
-            .filter(e => e.tMs >= aeMs - 60 * 1000 && e.tMs <= aeMs + 45 * 60 * 1000);
-          row.pipelineSeconds = candidates.length ? candidates[0].seconds : undefined;
+          const events = byUser.get(row.ae.user) ?? [];
+
+          // Whole-pipeline total: first `all` completing after the doc.
+          const allEv = events.filter(e => e.tag === 'all' &&
+            e.tMs >= aeMs - 60 * 1000 && e.tMs <= aeMs + 45 * 60 * 1000);
+          row.pipelineSeconds = allEv.length ? allEv[0].seconds : undefined;
+
+          // KPI total: latest gradle + latest webapp event belonging to this
+          // run (same look-back window and latest-per-tag rule as the
+          // expanded phase table, so the numbers always agree).
+          const inRun = events.filter(e =>
+            e.tMs >= aeMs - 45 * 60 * 1000 && e.tMs <= aeMs + 5 * 60 * 1000);
+          const latest = (...tags: string[]) => {
+            let best: { tMs: number; seconds: number } | undefined;
+            for (const e of inRun) {
+              if (tags.includes(e.tag) && (!best || e.tMs > best.tMs)) best = e;
+            }
+            return best;
+          };
+          const gradle = latest('gradle-build', 'gradle-rebuild');
+          const webapp = latest('webapp-startup', 'webapp-svc-startup');
+          row.kpiSeconds = gradle && webapp ? gradle.seconds + webapp.seconds : undefined;
         }
         this.drawChart();
         this.cd.detectChanges();
       },
       error: () => {
-        // Pipeline totals are best-effort; the rest of the page still works.
+        // gdev totals are best-effort; the rest of the page still works.
         this.drawChart();
         this.cd.detectChanges();
       }
@@ -353,10 +383,10 @@ export class App implements OnInit {
     const byBranch = new Map<string, { x: string; y: number }[]>();
     // iterate oldest → newest so chart's x-axis reads left-to-right
     [...this.startups].reverse().forEach(s => {
-      if (s.pipelineSeconds == null) return;
+      if (s.kpiSeconds == null) return;
       const branch = s.ae.branch || 'unknown';
       if (!byBranch.has(branch)) byBranch.set(branch, []);
-      byBranch.get(branch)!.push({ x: s.ae['@timestamp'], y: s.pipelineSeconds });
+      byBranch.get(branch)!.push({ x: s.ae['@timestamp'], y: s.kpiSeconds });
     });
 
     const palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
@@ -379,7 +409,7 @@ export class App implements OnInit {
         parsing: { xAxisKey: 'x', yAxisKey: 'y' } as any,
         scales: {
           x: { type: 'time' as any, time: { unit: 'day' as any } } as any,
-          y: { title: { display: true, text: 'gdev pipeline total (s)' } }
+          y: { title: { display: true, text: 'gradle + webapp (s)' } }
         },
         plugins: {
           legend: { position: 'top' },
