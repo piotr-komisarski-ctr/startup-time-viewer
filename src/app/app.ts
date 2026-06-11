@@ -43,8 +43,10 @@ interface StartupRow {
   phases?: GdevPhase[];  // populated lazily on expand
   loadingPhases?: boolean;
   expanded?: boolean;
-  totalAppianMs?: number;
-  totalMs?: number;
+  // Duration of gdev's whole on_start pipeline (the `tag=all` event in
+  // gdev-events-1): gradle -> docker -> webapp -> daemons. Excludes agent
+  // provisioning / file sync, which happen before on_start.
+  pipelineSeconds?: number;
 }
 
 @Component({
@@ -111,25 +113,83 @@ export class App implements OnInit {
     this.http.post<any>(`${ES_URL}/${INDEX_AE}/_search`, body).subscribe({
       next: (r) => {
         const hits = (r?.hits?.hits ?? []) as any[];
-        this.startups = hits.map((h: any): StartupRow => {
-          const ae = h._source as AeDoc;
-          const total = ae.tomcat_metrics?.find(m => m.name === 'startup_totalTimeMs')?.duration_ms;
-          const totalAppian = ae.tomcat_metrics?.find(m => m.name === 'startup_totalTimeAppianMs')?.duration_ms;
-          return {
-            ae,
-            totalMs: total,
-            totalAppianMs: totalAppian,
-            expanded: false
-          };
-        });
+        this.startups = hits.map((h: any): StartupRow => ({
+          ae: h._source as AeDoc,
+          expanded: false
+        }));
         this.refreshFacets();
-        this.drawChart();
+        this.loadPipelineTotals();
         this.loading = false;
         this.cd.detectChanges();
       },
       error: (err) => {
         this.errorMsg = `Fetch failed: ${err?.message ?? err}`;
         this.loading = false;
+        this.cd.detectChanges();
+      }
+    });
+  }
+
+  // Parses an ES timestamp to epoch ms, treating suffix-less values as UTC
+  // (gdev-events-1 stores @timestamp without a timezone suffix).
+  private parseTsMs(ts: string): number {
+    const hasTz = /Z$|[+-]\d{2}:?\d{2}$/.test(ts);
+    return new Date(hasTz ? ts : ts + 'Z').getTime();
+  }
+
+  // Fetches gdev's `tag=all` events (duration of the whole on_start pipeline)
+  // in ONE query for every listed startup, then matches each AE doc to the
+  // first `all` event from the same user that completes shortly after the doc
+  // was published (the doc goes out right after webapp turns healthy; the
+  // remaining daemons finish within minutes).
+  private loadPipelineTotals(): void {
+    if (!this.startups.length) {
+      this.drawChart();
+      return;
+    }
+    const times = this.startups.map(s => this.parseTsMs(s.ae['@timestamp']));
+    const users = [...new Set(this.startups.map(s => s.ae.user))];
+    const winStart = new Date(Math.min(...times) - 60 * 1000).toISOString();
+    const winEnd = new Date(Math.max(...times) + 60 * 60 * 1000).toISOString();
+
+    const body = {
+      size: 2000,
+      sort: [{ '@timestamp': 'asc' }],
+      query: {
+        bool: {
+          filter: [
+            { term: { 'payload.tag.keyword': 'all' } },
+            { terms: { user: users } },
+            { range: { '@timestamp': { gte: winStart, lte: winEnd } } }
+          ]
+        }
+      }
+    };
+
+    this.http.post<any>(`${ES_URL}/${INDEX_GDEV}/_search`, body).subscribe({
+      next: (r) => {
+        const byUser = new Map<string, { tMs: number; seconds: number }[]>();
+        for (const h of (r?.hits?.hits ?? []) as any[]) {
+          const s = h._source;
+          const durRaw = s?.payload?.duration ?? s?.duration;
+          const dur = typeof durRaw === 'string' ? parseFloat(durRaw) : Number(durRaw);
+          if (!isFinite(dur) || dur <= 0) continue;
+          const list = byUser.get(s.user) ?? [];
+          list.push({ tMs: this.parseTsMs(s['@timestamp']), seconds: dur });
+          byUser.set(s.user, list);
+        }
+        for (const row of this.startups) {
+          const aeMs = this.parseTsMs(row.ae['@timestamp']);
+          const candidates = (byUser.get(row.ae.user) ?? [])
+            .filter(e => e.tMs >= aeMs - 60 * 1000 && e.tMs <= aeMs + 45 * 60 * 1000);
+          row.pipelineSeconds = candidates.length ? candidates[0].seconds : undefined;
+        }
+        this.drawChart();
+        this.cd.detectChanges();
+      },
+      error: () => {
+        // Pipeline totals are best-effort; the rest of the page still works.
+        this.drawChart();
         this.cd.detectChanges();
       }
     });
@@ -293,10 +353,10 @@ export class App implements OnInit {
     const byBranch = new Map<string, { x: string; y: number }[]>();
     // iterate oldest → newest so chart's x-axis reads left-to-right
     [...this.startups].reverse().forEach(s => {
-      if (s.totalMs == null) return;
+      if (s.pipelineSeconds == null) return;
       const branch = s.ae.branch || 'unknown';
       if (!byBranch.has(branch)) byBranch.set(branch, []);
-      byBranch.get(branch)!.push({ x: s.ae['@timestamp'], y: s.totalMs / 1000 });
+      byBranch.get(branch)!.push({ x: s.ae['@timestamp'], y: s.pipelineSeconds });
     });
 
     const palette = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
@@ -319,7 +379,7 @@ export class App implements OnInit {
         parsing: { xAxisKey: 'x', yAxisKey: 'y' } as any,
         scales: {
           x: { type: 'time' as any, time: { unit: 'day' as any } } as any,
-          y: { title: { display: true, text: 'startup_totalTimeMs (s)' } }
+          y: { title: { display: true, text: 'gdev pipeline total (s)' } }
         },
         plugins: {
           legend: { position: 'top' },

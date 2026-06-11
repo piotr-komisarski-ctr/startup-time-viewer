@@ -68,7 +68,7 @@
   }
 
   <section class="chart-section">
-    <h2>Total startup time over time, per branch</h2>
+    <h2>Full gdev pipeline duration over time, per branch</h2>
     <div class="chart-wrapper">
       <canvas id="totalChart"></canvas>
     </div>
@@ -91,8 +91,7 @@
           <th>Branch</th>
           <th>Commit</th>
           <th>Release</th>
-          <th title="startup_totalTimeMs — webapp container only: JVM start to first HTTP request. NOT the whole gdev pipeline; expand the row for gradle/docker/daemon phase totals.">Webapp&nbsp;boot</th>
-          <th title="startup_totalTimeAppianMs — the Appian-bootstrap part of webapp boot (Spring context + listeners), excluding bare Tomcat overhead.">Appian&nbsp;init</th>
+          <th title="gdev's 'all' event — duration of the entire on_start pipeline (gradle build → docker build → webapp → daemons). Excludes agent provisioning/file sync. Webapp-only timings are in the expanded row's tomcat_metrics.">Pipeline&nbsp;total</th>
         </tr>
       </thead>
       <tbody>
@@ -105,12 +104,11 @@
             <td>{{ row.ae.branch }}</td>
             <td class="mono">{{ row.ae.commit }}</td>
             <td>{{ row.ae.latest_tag || '—' }}</td>
-            <td>{{ fmt(row.totalMs) }}</td>
-            <td>{{ fmt(row.totalAppianMs) }}</td>
+            <td>{{ fmtSec(row.pipelineSeconds) }}</td>
           </tr>
           @if (row.expanded) {
             <tr class="detail-row">
-              <td colspan="9">
+              <td colspan="8">
                 <div class="detail">
 
                   <div class="detail-block">
