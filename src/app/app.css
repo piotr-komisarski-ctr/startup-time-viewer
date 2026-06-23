@@ -203,6 +203,14 @@
   }
 }
 
+/* Grid tracks default to min-width:auto (= min-content), so an unbreakable
+   class name like com.appiancorp.expr.server.reaction... forces the track —
+   and the whole row — wider than the viewport. min-width:0 lets the track
+   shrink and the table wrap instead. */
+.detail-block {
+  min-width: 0;
+}
+
 .detail-block h3 {
   font-size: 12.5px;
   margin: 0 0 6px;
@@ -218,6 +226,13 @@ table.inner {
   border: 1px solid #e5e7eb;
   border-radius: 4px;
   overflow: hidden;
+}
+
+/* Let long bean/class/metric names wrap rather than overflow. */
+table.inner th,
+table.inner td {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 table.inner thead th {
